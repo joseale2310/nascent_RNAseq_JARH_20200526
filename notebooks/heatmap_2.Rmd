@@ -1,0 +1,308 @@
+---
+title: "DEA heatmap for RNAseq"
+author: "Jose Alejandro Romero Herrera"
+date: '`r Sys.Date()`'
+knit: (function(inputFile, encoding) { 
+      rmarkdown::render(inputFile,
+                        encoding=encoding,
+                        output_format='all',
+                        output_dir='../reports/')})
+output:
+  # To create PDF report, uncomment below
+  #pdf_document:
+  #  toc: yes
+  html_document:
+    number_sections: yes
+    theme: yeti
+    toc: yes
+    toc_float: yes
+    df_print: paged
+    dev: png
+---
+
+```{r knitr, include = FALSE}
+DOCNAME = knitr::current_input()
+knitr::opts_chunk$set(autodep        = TRUE,
+                      cache          = FALSE,
+                      cache.path     = paste0("cache/", DOCNAME, "/"),
+                      cache.comments = TRUE,
+                      echo           = TRUE,
+                      error          = FALSE,
+                      fig.align      = "center",
+                      fig.path       = paste0("../reports/figures/", DOCNAME, "/"),
+                      fig.width      = 10,
+                      fig.height     = 8,
+                      message        = FALSE,
+                      warning        = FALSE)
+```
+
+# Introduction
+In this script we will generate the heatmap plot for Elena's nascent RNAseq. First, the whole plot. Then we will separate the genes by the row annotation:
+ - pErk mutant UP + pErk UP
+ - pErk mutant UP + pErk DOWN
+ - pErk mutant DOWN + pErk UP
+ - pErk mutant DOWN + pErk DOWN
+ 
+# Load libraries
+
+```{r}
+library(DESeq2)
+library(tidyverse)
+library(RColorBrewer) #colour scheme for hierarchical clustering heatmap
+library(ggrepel) #labels for ggplot
+library(ggdendro)
+library(reshape2)
+library(apeglm) #for MAplot function in DESEq2
+library(genefilter) #top var genes
+library(pheatmap)
+library(readxl)
+library(stringr)
+```
+Create results folder for this notebook
+```{r}
+results_folder <- "../results/heatmap/"
+
+if(!file.exists(results_folder)){
+  dir.create(results_folder)
+}
+```
+
+# Loading initial data
+```{r}
+data_path <- "../data/counts_gene-id_gene.txt"
+data <- read.delim(data_path,as.is=T)
+```
+
+Annotations of the data
+```{r}
+annot <- data[,1:6]
+```
+
+Counts. "-11" is to pick the 8h samples (which are the 12 last samples of the file)
+
+```{r}
+counts <- as.matrix(data[,(ncol(data)-11):ncol(data)])
+```
+
+Getting gene names from the mouse ensembl data base
+```{r}
+genes <- annot$Geneid
+require(org.Mm.eg.db)
+db <- org.Mm.eg.db
+ensembl <- suppressWarnings(mapIds(db, keys=genes, keytype="ENSEMBL", column="SYMBOL",multiVals="first"))
+genes <- data.frame(SYMBOL = ensembl, ENSEMBL = genes, stringsAsFactors = F)
+genes$SYMBOL[is.na(genes$SYMBOL)] = genes$ENSEMBL[is.na(genes$SYMBOL)]
+
+annot$GeneSymbol = genes$SYMBOL
+```
+
+
+Getting sample annotations for DEseq analysis. We need to extract information (metadata) from sample column names
+```{r}
+names = colnames(counts)
+names = sapply(names,function(x) gsub("X8h","X_8h",x))
+p1 = "(.*)_(.*)_(.*)_(.*)_(.*)_uniq"
+colData <- data.frame(str_match(names,p1),stringsAsFactors = F)
+colnames(colData) = c("Sample","Dox","Time","Tam","Rep","Rep2")
+colData$SampleName = colnames(counts)
+colData$TimePt = as.numeric(str_match(colData$Time,"^(.*)h")[,2])
+```
+
+samples to fix: the Tam field should be empty and the values there should move to Dox. This does not seem to apply to the 8h time point, i believe it is for the ones before the 2nd treatment
+```{r}
+idx = colData$Dox=="X"
+colData[idx,"Dox"] = colData[idx,"Tam"]
+colData[idx,"Tam"] = NA
+
+colData$SampleNameShort = with(colData,paste(Dox,Tam,Time,Rep2, sep="_"))
+colData$ShortLabel = with(colData,paste(Dox,Tam,Time, sep="_"))
+colData$ShortLabelTime = with(colData,paste(Dox,Tam, sep="_"))
+```
+
+# DOX_4OHT_vs_H2O_4OHT comparison
+
+## Create colData
+```{r}
+colData$condition = factor(colData$ShortLabel, levels = c("H2O_4OHT_8h","H2O_ETOH_8h","DOX_ETOH_8h","DOX_4OHT_8h"))
+colData$Dox = factor(colData$Dox, levels = c("H2O","DOX"))
+colData$Tam = factor(colData$Tam, levels = c("ETOH", "4OHT"))
+```
+
+## DESeq analysis ###
+
+```{r}
+dds <- DESeqDataSetFromMatrix(counts, colData, design = ~ condition)
+```
+
+Adding the extrated annotation that we did at the beginning and add it to the information that we just retrieved
+
+```{r}
+mcols(dds) = cbind(annot,mcols(dds))
+```
+
+Pre-filtering the dataset
+```{r}
+nrow(dds)
+dds <- dds[rowSums(counts(dds)) > 10, ]
+nrow(dds)
+```
+
+## Results 
+```{r}
+dds <- DESeq(dds)
+res <- results(dds, name = "condition_DOX_4OHT_8h_vs_H2O_4OHT_8h")
+res <- as.data.frame(res)
+res$gene_name <- mcols(dds)$Geneid
+res[["padj"]][is.na(res[["padj"]])]<-0.99
+res[["log2FoldChange"]][is.na(res[["log2FoldChange"]])]<-0
+```
+
+Extract Up and down regulated genes
+```{r}
+up_dox_tam_vs_h2o_tam<-filter(res,log2FoldChange>1, padj<0.05)$gene_name
+down_dox_tam_vs_h2o_tam<-filter(res,log2FoldChange<(-1),padj<0.05)$gene_name
+
+up_and_down_dox_tam_vs_h2o_tam <- filter(res, abs(log2FoldChange)> 1, padj < 0.05)
+```
+
+# H2O_ETOH as reference
+
+Modify colData
+```{r}
+colData$condition = factor(colData$ShortLabel, levels = c("H2O_ETOH_8h","H2O_4OHT_8h","DOX_ETOH_8h","DOX_4OHT_8h"))
+colData$Dox = factor(colData$Dox, levels = c("H2O","DOX"))
+colData$Tam = factor(colData$Tam, levels = c("ETOH", "4OHT"))
+```
+
+## DESeq analysis
+```{r}
+dds <- DESeqDataSetFromMatrix(counts, colData, design = ~ condition)
+```
+
+Adding the extrated annotation that we did at the beginning and add it to the information that we just retrieved
+```{r}
+mcols(dds) = cbind(annot,mcols(dds))
+```
+
+Pre-filtering the dataset
+```{r}
+nrow(dds)
+dds <- dds[rowSums(counts(dds)) > 10, ]
+nrow(dds)
+```
+
+### DE analysis 4OHT vs Control
+
+Get Up and down regulated pErk regulated genes
+```{r}
+dds <- DESeq(dds)
+res <- results(dds, name = "condition_H2O_4OHT_8h_vs_H2O_ETOH_8h")
+res <- as.data.frame(res)
+res$gene_name <- mcols(dds)$Geneid
+res[["padj"]][is.na(res[["padj"]])]<-0.99
+res[["log2FoldChange"]][is.na(res[["log2FoldChange"]])]<-0
+
+up<-filter(res,log2FoldChange>1, padj<0.05)
+down<-filter(res,log2FoldChange<(-1),padj<0.05)
+
+up_and_down_tam_vs_etoh <- filter(res, abs(log2FoldChange)> 1, padj < 0.05)
+up_and_down_tam_vs_etoh$DE <- "Up"
+up_and_down_tam_vs_etoh$DE[up_and_down_tam_vs_etoh$log2FoldChange < (-1)] <- "Down"
+```
+
+# Heatmap of genes regulated by pErk
+
+```{r}
+#mat <- assay(normTransform(dds))
+mat <- assay(rlog(dds))
+rownames(mat) <- mcols(dds)$Geneid
+mat  <- mat[up_and_down_tam_vs_etoh$gene_name,]
+#mat  <- mat - rowMeans(mat)
+mat <- mat[,c("H2O_8h_ETOH_a_S19_uniq", "H2O_8h_ETOH_b_S20_uniq", "H2O_8h_ETOH_d_S21_uniq",
+              "DOX_8h_ETOH_a_S22_uniq", "DOX_8h_ETOH_b_S23_uniq", "DOX_8h_ETOH_d_S24_uniq",
+              "H2O_8h_4OHT_a_S25_uniq", "H2O_8h_4OHT_b_S26_uniq", "H2O_8h_4OHT_d_S27_uniq",
+              "DOX_8h_4OHT_a_S28_uniq", "DOX_8h_4OHT_b_S29_uniq", "DOX_8h_4OHT_d_S30_uniq")]
+```
+
+```{r}
+#row_clustering <- hclust(dist(mat[,c("H2O_8h_4OHT_a_S25_uniq", "H2O_8h_4OHT_b_S26_uniq", "H2O_8h_4OHT_d_S27_uniq",
+#                                     "H2O_8h_ETOH_a_S19_uniq", "H2O_8h_ETOH_b_S20_uniq", "H2O_8h_ETOH_d_S21_uniq",
+#                                     "DOX_8h_4OHT_a_S28_uniq", "DOX_8h_4OHT_b_S29_uniq", "DOX_8h_4OHT_d_S30_uniq")]))
+```
+
+Row annotation (gene annotation)
+```{r}
+row_anno <- data.frame(row.names = rownames(mat), pErk_DE = up_and_down_tam_vs_etoh$DE)
+
+row_anno$pErk_mutant_DE <- "No change"
+row_anno$pErk_mutant_DE[row.names(row_anno) %in% intersect(row.names(row_anno), up_dox_tam_vs_h2o_tam)] <- "Up"
+row_anno$pErk_mutant_DE[row.names(row_anno) %in% intersect(row.names(row_anno), down_dox_tam_vs_h2o_tam) ] <- "Down"
+```
+
+Column annotation (sample annotation)
+```{r}
+anno <- as.data.frame(colData(dds)[c("H2O_8h_4OHT_a_S25_uniq", "H2O_8h_4OHT_b_S26_uniq", "H2O_8h_4OHT_d_S27_uniq",
+                                     "DOX_8h_4OHT_a_S28_uniq", "DOX_8h_4OHT_b_S29_uniq", "DOX_8h_4OHT_d_S30_uniq",
+                                     "H2O_8h_ETOH_a_S19_uniq", "H2O_8h_ETOH_b_S20_uniq", "H2O_8h_ETOH_d_S21_uniq", 
+                                     "DOX_8h_ETOH_a_S22_uniq", "DOX_8h_ETOH_b_S23_uniq", "DOX_8h_ETOH_d_S24_uniq"), c("Dox","Tam")])
+colnames(anno) <- c("Oct4", "pErk")
+anno$Oct4 <- as.character(anno$Oct4)
+anno$Oct4[which(anno$Oct4 == "DOX")] <- "-"
+anno$Oct4[which(anno$Oct4 == "H2O")] <- "+"
+anno$Oct4 <- as.factor(anno$Oct4)
+
+anno$pErk <- as.character(anno$pErk)
+anno$pErk[which(anno$pErk == "4OHT")] <- "+"
+anno$pErk[which(anno$pErk == "ETOH")] <- "-"
+anno$pErk <- as.factor(anno$pErk)
+```
+
+Annotation colors
+```{r}
+ann_colors <- list(Oct4 = c("+"="grey45", "-"= "grey75"), pErk = c("+"="grey45", "-"= "grey75"),
+                   pErk_DE = c("Up" = "firebrick2", "Down" = "skyblue2"),
+                   pErk_mutant_DE = c("Up" = "firebrick2", "Down" = "skyblue2", "No change" = "grey"))
+```
+
+Create heatmap
+```{r original_heatmap, fig.height=7, fig.width=7}
+hm<- pheatmap(#filename = "../results/tam_vs_etoh_annotated_heatmap.png"),  
+              mat, annotation_col = anno, annotation_colors = ann_colors, 
+              annotation_row = row_anno, 
+              show_rownames = F, show_colnames = F, 
+              cluster_cols = F, cluster_rows = T, 
+              main = "Dysregulation of Fgf-Erk dependent genes\nAbsolute LFC >1, adj. p-value <0.05", scale = "row",
+              treeheight_row = 0, treeheight_col = 0, width = 7, height = 9)
+```
+
+# Ordered plot
+```{r}
+ordered_mat <- mat[order(row_anno[,1],row_anno[,2],decreasing = T),]
+```
+
+
+```{r ordered_heatmap, fig.height=7, fig.width=7}
+hm<- pheatmap(#filename = paste0(dir,"results/tam_vs_etoh_annotated_heatmap.png"),  
+              ordered_mat, annotation_col = anno, annotation_colors = ann_colors, 
+              annotation_row = row_anno, 
+              show_rownames = F, show_colnames = F, 
+              cluster_cols = F, cluster_rows = F, 
+              main = "Dysregulation of Fgf-Erk dependent genes\nAbsolute LFC >1, adj. p-value <0.05", scale = "row",
+              treeheight_row = 0, treeheight_col = 0, width = 7, height = 9)
+```
+
+# Save gene annotations (row_anno)
+```{r}
+row_anno$Geneid <- rownames(row_anno)
+
+row_anno <- merge(row_anno, mcols(dds)[,c("Geneid","GeneSymbol")], by = "Geneid")
+write.table(row_anno, file = paste0(results_folder,"tam_vs_etoh_annotated_heatmap_row_anno.tsv"), 
+            row.names = F, col.names = T, sep = "\t", quote = F)
+```
+
+
+# Session info
+
+```{r session-info, cache = FALSE}
+devtools::session_info()
+```

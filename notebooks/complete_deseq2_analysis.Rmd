@@ -1,0 +1,467 @@
+---
+title: "Elena's nascent RNAseq analysis"
+author: "Jose Alejandro Romero Herrera"
+date: '`r Sys.Date()`'
+knit: (function(inputFile, encoding) { 
+      rmarkdown::render(inputFile,
+                        encoding=encoding,
+                        output_format='all',
+                        output_dir='../reports/')})
+output:
+  # To create PDF report, uncomment below
+  #pdf_document:
+  #  toc: yes
+  html_document:
+    number_sections: yes
+    theme: yeti
+    toc: yes
+    toc_float: yes
+    df_print: paged
+    dev: png
+---
+
+```{r knitr, include = FALSE}
+DOCNAME = knitr::current_input()
+knitr::opts_chunk$set(autodep        = TRUE,
+                      cache          = FALSE,
+                      cache.path     = paste0("cache/", DOCNAME, "/"),
+                      cache.comments = TRUE,
+                      echo           = TRUE,
+                      error          = FALSE,
+                      fig.align      = "center",
+                      fig.path       = paste0("../reports/figures/", DOCNAME, "/"),
+                      fig.width      = 10,
+                      fig.height     = 8,
+                      message        = FALSE,
+                      warning        = FALSE)
+```
+
+# Introduction
+
+This is a clean version of Elena's RNAseq analysis of the effect of Oct4 knockdown after pERK activation.
+
+# Load packages
+```{r, warning=FALSE, message=FALSE, error= FALSE}
+library(tidyverse)
+library(DESeq2)
+library(RColorBrewer) #colour scheme for hierarchical clustering heatmap
+library(ggdendro)
+library(ggrepel)
+library(reshape2)
+library(apeglm) #for LFC shrinkage in DESEq2
+library(genefilter) #top var genes
+library(pheatmap)
+library(readxl)
+library(xlsx)
+library(biomaRt)
+```
+
+Create results folder for this notebook
+```{r}
+results_folder <- "../results/complete_deseq2_analysis/"
+
+if(!file.exists(results_folder)){
+  dir.create(results_folder)
+}
+```
+
+# Load data
+```{r}
+data_path <- "../data/counts_gene-id_gene.txt"
+data <- read.delim(data_path, as.is=T)
+head(data)
+```
+
+Separate counts from gene metadata
+```{r}
+gene_metadata <- data[,1:6]
+rownames(data) <- data$Geneid
+data <- data[,-c(1:6)]
+```
+
+## Prepare gene names and ids
+Getting gene names from the mouse ensembl data base using Biomart
+```{r}
+genes_biomart <- data.frame(ensembl_gene_id = as.character(gene_metadata$Geneid))
+```
+
+
+```{r}
+getGeneAnnotationsMM = function(d="./",force=F){
+  
+  mart <- useMart(
+    host="https://www.ensembl.org", biomart = 'ENSEMBL_MART_ENSEMBL',
+    dataset = 'mmusculus_gene_ensembl')
+  
+  annot <- biomaRt::getBM(
+    attributes = c(
+      "ensembl_gene_id",
+      "external_gene_name",
+      "description"),
+    mart = mart)
+  
+  return(annot)
+}
+
+gene_annot <- getGeneAnnotationsMM()
+genes_biomart <- merge(genes_biomart, gene_annot, by.x = "ensembl_gene_id", sort = F, all.x = T)
+head(genes_biomart)
+```
+
+Replacing missing gene names for original ensembl id
+```{r}
+genes_biomart$external_gene_name[is.na(genes_biomart$external_gene_name)] <- genes_biomart$ensembl_gene_id[is.na(genes_biomart$external_gene_name)]
+```
+
+Checking duplicates
+```{r}
+# Check for gene id and name duplicates
+check_duplicates <- function(x, unique = T, show = F) {
+  duplicates <- sum(duplicated(x))
+  
+  if (duplicates == 0) {
+    print("There are no duplicates")
+    invisible(x)
+  }
+  else{
+    print(paste0("There are ",duplicates," duplicated IDs"))
+    if (show) {
+      print(table(x[duplicated(x)]))
+    }
+    if (unique) {
+      print(paste0("Making them unique"))
+      invisible(make.names(x, unique = T))
+    }
+    else{
+      invisible(x)
+    }
+  }
+}
+
+check_duplicates(genes_biomart$ensembl_gene_id, unique = F)
+check_duplicates(genes_biomart$external_gene_name, unique = F, show = T)
+```
+
+## Prepare sample metadata
+Extract information (metadata) from sample column names
+```{r}
+names = colnames(data)
+names = sapply(names,function(x) gsub("X8h","X_8h",x))
+p1 = "(.*)_(.*)_(.*)_(.*)_(.*)_uniq"
+colData <- data.frame(str_match(names,p1),stringsAsFactors = F)
+colnames(colData) = c("Sample","Dox","Time","Tam","Rep","Rep2")
+colData$SampleName = colnames(data)
+colData$TimePt = as.numeric(str_match(colData$Time,"^(.*)h")[,2])
+
+# samples to fix: the Tam field should be empty
+# and the values there should move to Dox
+## Jose: This does not seem to apply to the 8h time point, i believe it is for the ones before the 2nd treatment
+idx = colData$Dox=="X"
+colData[idx,"Dox"] = colData[idx,"Tam"]
+colData[idx,"Tam"] = NA
+
+colData$SampleNameShort = with(colData,paste(Dox,Tam,Time,Rep2, sep="_"))
+colData$ShortLabel = with(colData,paste(Dox,Tam,Time, sep="_"))
+colData$ShortLabelTime = with(colData,paste(Dox,Tam, sep="_"))
+colData$ShortLabel = factor(colData$ShortLabel)
+colData$ShortLabel = relevel(colData$ShortLabel, "H2O_NA_8h")
+```
+
+
+```{r}
+head(colData)
+```
+
+# DESEQ pre-analysis
+Removing rows with no counts
+```{r}
+filter <- rowSums(data) > 1
+print(paste0("Removing ", nrow(data) - sum(filter), " rows"))
+data <- data[filter,]
+```
+
+## Create DESEQ object
+```{r}
+#full condition
+dds <- DESeqDataSetFromMatrix(data, colData, design = ~ ShortLabel)
+dds <- DESeq(dds)
+```
+
+## Vst normalization
+```{r}
+vsd <- vst(dds)
+```
+
+### Principal component plot of the samples
+PCA plot using the first two components
+```{r}
+pcaData <- plotPCA(vsd, intgroup=c("ShortLabel"), returnData=TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+```
+
+
+```{r, PCA_plot}
+ggplot(pcaData, aes(PC1, PC2, color=ShortLabel, label=ShortLabel)) +
+  geom_point(size=3) + geom_text_repel() +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed() + theme_bw()
+```
+
+
+### Heatmap of the sample-to-sample distances
+This plot shows how far away are each sample from each other. The darker the blue, the closer they are.
+```{r distance_heatmap, fig.height=7, fig.width=7}
+sampleDists <- dist(t(assay(vsd)))
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- vsd$ShortLabel
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows=sampleDists,
+         clustering_distance_cols=sampleDists,
+         col=colors)
+```
+
+# DE analysis
+We have to do several DE analysis and create a list with all DE across conditions and timepoints
+```{r}
+LFC <- 1
+alpha <- 0.05
+
+filter_results <- function(result,LFC, alpha){
+    result <- as.data.frame(result)
+    result <- result[complete.cases(result),]
+    result <- result[abs(result$log2FoldChange) > LFC & result$padj < alpha,]
+    return(result)
+}
+
+result_list <- list()
+```
+
+## 0h comparisons
+DOX_NA_8h vs H2O_NA_8h
+The proper reference level is already establish
+```{r}
+resultsNames(dds)
+res <- results(dds, name = "ShortLabel_DOX_NA_8h_vs_H2O_NA_8h")
+result_list[["DOX_NA_8h_vs_H2O_NA_8h"]] <- filter_results(res, LFC, alpha)
+```
+
+## 2h comparisons
+DOX_ETOH_2h vs H2O_ETOH_2h
+H2O_4OHT_2h vs H2O_ETOH_2h
+DOX_4OHT_2h vs H2O_ETOH_2h
+```{r}
+dds$ShortLabel <- relevel(dds$ShortLabel, ref = "H2O_ETOH_2h")
+dds <- DESeq(dds)
+resultsNames(dds)
+
+res <- results(dds, name = "ShortLabel_DOX_ETOH_2h_vs_H2O_ETOH_2h")
+result_list[["DOX_ETOH_2h_vs_H2O_ETOH_2h"]] <- filter_results(res, LFC, alpha)
+
+res <- results(dds, name = "ShortLabel_H2O_4OHT_2h_vs_H2O_ETOH_2h")
+result_list[["H2O_4OHT_2h_vs_H2O_ETOH_2h"]] <- filter_results(res, LFC, alpha)
+
+res <- results(dds, name = "ShortLabel_DOX_4OHT_2h_vs_H2O_ETOH_2h")
+result_list[["DOX_4OHT_2h_vs_H2O_ETOH_2h"]] <- filter_results(res, LFC, alpha)
+```
+## 8h comparisons
+DOX_ETOH_8h vs H2O_ETOH_8h
+H2O_4OHT_8h vs H2O_ETOH_8h
+DOX_4OHT_8h vs H2O_ETOH_8h
+```{r}
+dds$ShortLabel <- relevel(dds$ShortLabel, ref = "H2O_ETOH_8h")
+dds <- DESeq(dds)
+resultsNames(dds)
+
+res <- results(dds, name = "ShortLabel_DOX_ETOH_8h_vs_H2O_ETOH_8h")
+result_list[["DOX_ETOH_8h_vs_H2O_ETOH_8h"]] <- filter_results(res, LFC, alpha)
+
+res <- results(dds, name = "ShortLabel_H2O_4OHT_8h_vs_H2O_ETOH_8h")
+result_list[["H2O_4OHT_8h_vs_H2O_ETOH_8h"]] <- filter_results(res, LFC, alpha)
+
+res <- results(dds, name = "ShortLabel_DOX_4OHT_8h_vs_H2O_ETOH_8h")
+result_list[["DOX_4OHT_8h_vs_H2O_ETOH_8h"]] <- filter_results(res, LFC, alpha)
+```
+## All DE genes for all conditions
+```{r}
+DE_ids <- unique(unlist(lapply(result_list, rownames), use.names = F))
+```
+
+# Save all results
+In an excel file
+```{r}
+add_data <- function(name,data,workbook){
+  df <- data[name]
+  new_sheet <- createSheet(workbook, sheetName = name)
+  addDataFrame(df, sheet = new_sheet)
+}
+```
+
+```{r}
+wb <- createWorkbook()
+sheet_names <- names(result_list)
+
+lapply(sheet_names, FUN = add_data, result_list, wb)
+saveWorkbook(wb, file = paste0(results_folder, "DEG_all_comparisons.xlsx"))
+```
+
+# Heatmaps
+```{r}
+vsd <- assay(vsd)
+
+vsd <- aggregate(t(vsd), by = list(colData$ShortLabel), mean)
+vsd_names <- vsd[,1]
+vsd <- vsd[,-1]
+vsd <- data.frame(t(vsd))
+colnames(vsd) <- vsd_names
+```
+
+## pERK activation only
+```{r perk_activation_heatmap}
+perk_activation <- vsd[DE_ids,c("H2O_NA_8h", "H2O_4OHT_2h", "H2O_4OHT_8h")]
+                          
+pheatmap(perk_activation, show_rownames = F, cluster_cols = F, scale = "row")
+```
+
+## pERK activation and OCT4 KO
+```{r perk_activation_Oct4_heatmap}
+oct4_downregulation <- vsd[DE_ids,c("H2O_NA_8h", "DOX_4OHT_2h", "DOX_4OHT_8h")]
+                          
+pheatmap(oct4_downregulation, show_rownames = F, cluster_cols = F, treeheight_row = 0, scale = "row")
+```
+
+## All
+```{r all_heatmap}
+heatmap_data <- vsd[DE_ids, c("H2O_NA_8h", "H2O_4OHT_2h", "H2O_4OHT_8h", "DOX_4OHT_2h", "DOX_4OHT_8h")]
+
+annot_col <- data.frame(pErk = c("0h", "2h","8h","2h","8h"),
+                        Oct4 = c("+", "+", "+","-","-"),
+                        row.names = colnames(heatmap_data))
+
+colnames(annot_col)[1] <- "pErk activation"
+
+pheatmap(heatmap_data, show_rownames = F, cluster_cols = F, treeheight_row = 0, scale = "row", show_colnames = F, annotation_col = annot_col)
+```
+
+# Josh's requests
+These plots were asked by Josh for a grant report
+
+## Only UP regulated Genes in the pERK time course
+
+```{r}
+pERK_results <- result_list[c(3,6,4,7)]
+
+test <- function(x){
+ return(rownames(x[x$log2FoldChange > 0,]))
+}
+
+DE_ids_up <- unique(unlist(lapply(pERK_results,test), use.names = F))
+```
+
+```{r}
+heatmap_data <- vsd[DE_ids_up, c("H2O_NA_8h", "H2O_4OHT_2h", "H2O_4OHT_8h", "DOX_4OHT_2h", "DOX_4OHT_8h")]
+
+annot_col <- data.frame(pErk = c("0h", "2h","8h","2h","8h"),
+                        Oct4 = c("+", "+", "+","-","-"),
+                        row.names = colnames(heatmap_data))
+
+colnames(annot_col)[1] <- "pErk activation"
+```
+
+```{r}
+pheatmap(heatmap_data, show_rownames = F, cluster_cols = F, treeheight_row = 0, scale = "row", show_colnames = F, 
+         annotation_col = annot_col, cluster_rows = T,
+         main = "Up-regulated genes after pERK activation\nwith and without Oct4")
+```
+
+```{r pERK_up_heatmap_nocluster}
+pheatmap(heatmap_data, show_rownames = F, cluster_cols = F, treeheight_row = 0, scale = "row", show_colnames = F, 
+         annotation_col = annot_col, cluster_rows = F,
+         main = "Up-regulated genes after pERK activation\nwith and without Oct4")
+```
+
+Divide clusters and select 2h and 8h cluster
+```{r}
+cluster_2h <- t(scale(t(heatmap_data[,c("H2O_NA_8h","H2O_4OHT_2h", "DOX_4OHT_2h")])))
+cluster_2h <- hclust(dist(cluster_2h))
+
+cluster_8h <- t(scale(t(heatmap_data[,c("H2O_NA_8h","H2O_4OHT_8h", "DOX_4OHT_8h")])))
+cluster_8h <- hclust(dist(cluster_8h))
+```
+
+```{r pERK_up_2h_heatmap}
+pheatmap(heatmap_data, show_rownames = F, cluster_cols = F, cluster_rows = cluster_2h,
+         treeheight_row = 0, scale = "row", show_colnames = F, annotation_col = annot_col,
+         main = "Up-regulated genes after pERK activation\nwith and without Oct4 (genes clustered by 2h)")
+```
+
+```{r pERK_up_8h_heatmap}
+pheatmap(heatmap_data, show_rownames = F, cluster_cols = F,cluster_rows = cluster_8h,
+         treeheight_row = 0, scale = "row", show_colnames = F, annotation_col = annot_col,
+         main = "Up-regulated genes after pERK activation\nwith and without Oct4 (genes clustered by 8h)")
+```
+
+## Only DOWN regulated Genes in the pERK time course
+
+```{r}
+pERK_results <- result_list[c(3,6,4,7)]
+
+test <- function(x){
+ return(rownames(x[x$log2FoldChange < 0,]))
+}
+
+DE_ids_down <- unique(unlist(lapply(pERK_results,test), use.names = F))
+```
+
+```{r}
+heatmap_data <- vsd[DE_ids_down, c("H2O_NA_8h", "H2O_4OHT_2h", "H2O_4OHT_8h", "DOX_4OHT_2h", "DOX_4OHT_8h")]
+
+annot_col <- data.frame(pErk = c("0h", "2h","8h","2h","8h"),
+                        Oct4 = c("+", "+", "+","-","-"),
+                        row.names = colnames(heatmap_data))
+
+colnames(annot_col)[1] <- "pErk activation"
+```
+
+```{r pERK_down_heatmap}
+pheatmap(heatmap_data, show_rownames = F, cluster_cols = F, treeheight_row = 0, scale = "row", 
+         show_colnames = F, annotation_col = annot_col,
+         main = "Down-regulated genes after pERK activation\nwith and without Oct4")
+```
+
+```{r pERK_down_heatmap_nocluster}
+pheatmap(heatmap_data, show_rownames = F, cluster_cols = F, treeheight_row = 0, scale = "row", 
+         show_colnames = F, annotation_col = annot_col, cluster_rows = F,
+         main = "Down-regulated genes after pERK activation\nwith and without Oct4")
+```
+
+Divide clusters and do only 2 and 8h
+```{r}
+cluster_2h <- t(scale(t(heatmap_data[,c("H2O_NA_8h","H2O_4OHT_2h", "DOX_4OHT_2h")])))
+cluster_2h <- hclust(dist(cluster_2h))
+
+cluster_8h <- t(scale(t(heatmap_data[,c("H2O_NA_8h","H2O_4OHT_8h", "DOX_4OHT_8h")])))
+cluster_8h <- hclust(dist(cluster_8h))
+```
+
+
+```{r pERK_down_2h_heatmap}
+pheatmap(heatmap_data, show_rownames = F, cluster_cols = F, cluster_rows = cluster_2h,
+         treeheight_row = 0, scale = "row", show_colnames = F, annotation_col = annot_col,
+         main = "Down-regulated genes after pERK activation\nwith and without Oct4 (genes clustered by 2h)")
+```
+
+
+```{r pERK_down_8h_heatmap}
+pheatmap(heatmap_data, show_rownames = F, cluster_cols = F,cluster_rows = cluster_8h,
+         treeheight_row = 0, scale = "row", show_colnames = F, annotation_col = annot_col,
+         main = "Down-regulated genes after pERK activation\nwith and without Oct4 (genes clustered by 8h)")
+```
+
+# Session info
+
+```{r session-info, cache = FALSE}
+devtools::session_info()
+```
